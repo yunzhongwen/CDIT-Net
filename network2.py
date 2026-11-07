@@ -4,24 +4,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from thop import profile
 
-# 自动选择设备
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def get_group_norm(channels, max_groups=8):
-    """自适应 GroupNorm 工具函数，防止组数不整除通道数，彻底替代 InstanceNorm 以保留焦点方差特征"""
     groups = max_groups
     while channels % groups != 0 and groups > 1:
         groups //= 2
     return nn.GroupNorm(groups, channels)
 
 
-# =========================================================================
-# 基础增强模块：深度残差块 (ResBlock)
-# =========================================================================
 class ResBlock(nn.Module):
-    """带 GroupNorm 的增强型残差模块，提升局部高频与梯度特征表征能力"""
-
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
         self.conv1 = nn.Conv2d(
@@ -50,12 +43,7 @@ class ResBlock(nn.Module):
         return self.act(out + self.shortcut(x))
 
 
-# =========================================================================
-# 核心模块 1：扩张卷积投影 (Dilated Convolutional Projection, DCP)
-# =========================================================================
 class DilatedConvProjection(nn.Module):
-    """扩张卷积投影 (DCP)：替代传统 Transformer 中的线性映射，注入局部空间与多感受野信息"""
-
     def __init__(self, embed_dim):
         super().__init__()
         self.proj = nn.Sequential(
@@ -68,7 +56,6 @@ class DilatedConvProjection(nn.Module):
                 dilation=2,
                 groups=embed_dim,
             ),
-            # 替换为 GroupNorm 以保留跨图像域的焦点对比度与强度方差
             get_group_norm(embed_dim),
             nn.GELU(),
         )
@@ -77,20 +64,13 @@ class DilatedConvProjection(nn.Module):
         return self.proj(x)
 
 
-# =========================================================================
-# 核心模块 2：优化版高频极值感知局部注意力
-# =========================================================================
 class LocalAttention(nn.Module):
-    """优化版局部注意力：利用空间维度的 Max/Avg 极值突显焦点高频边缘与显著梯度"""
-
     def __init__(self, channels):
         super().__init__()
-        # 利用大核卷积在空间维度上融合极值图
         self.spatial_gate = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
             nn.Sigmoid(),
         )
-        # 深度可分离卷积进行细节增强
         self.detail_enhance = nn.Sequential(
             nn.Conv2d(
                 channels, channels, kernel_size=3, padding=1, groups=channels
@@ -100,7 +80,6 @@ class LocalAttention(nn.Module):
         )
 
     def forward(self, x):
-        # 提取空间维度的最大值与平均值（最大值响应可极大地突显聚焦高频边缘）
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         avg_out = torch.mean(x, dim=1, keepdim=True)
         spatial_map = torch.cat([max_out, avg_out], dim=1)
@@ -111,8 +90,6 @@ class LocalAttention(nn.Module):
 
 
 class MixFFN(nn.Module):
-    """混合前馈网络 (Mix-FFN)"""
-
     def __init__(self, embed_dim, hidden_dim, dropout=0.1):
         super().__init__()
         self.fc1 = nn.Linear(embed_dim, hidden_dim)
@@ -142,8 +119,6 @@ class MixFFN(nn.Module):
 
 
 class InteractiveTransformerBlock(nn.Module):
-    """瓶颈层交互 Transformer 模块 (融入 DCP 投影与 SRA 空间降维保护)"""
-
     def __init__(self, embed_dim, num_heads, reduction_size=32, dropout=0.1):
         super().__init__()
         self.reduction_size = reduction_size
@@ -201,8 +176,6 @@ class InteractiveTransformerBlock(nn.Module):
 
 
 class GlobalLocalAttention(nn.Module):
-    """全局-局部注意力 (GLA)：加入 SRA 空间降维保护，彻底解决解码器大图推理 OOM"""
-
     def __init__(self, channels, num_heads=4, reduction_size=32, dropout=0.1):
         super().__init__()
         self.reduction_size = reduction_size
@@ -252,8 +225,6 @@ class GlobalLocalAttention(nn.Module):
 
 
 class ChannelAttention(nn.Module):
-    """通道注意力机制"""
-
     def __init__(self, channels, reduction=16):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -272,8 +243,6 @@ class ChannelAttention(nn.Module):
 
 
 class Output(nn.Module):
-    """深度残差细化模块"""
-
     def __init__(self, in_channels=64, out_channels=64):
         super().__init__()
         mid_channels = int(in_channels * 1.5)
@@ -307,12 +276,7 @@ class Output(nn.Module):
         return self.act(x + residual)
 
 
-# =========================================================================
-# 核心模块 3：跨域交互 Transformer (CDIT)
-# =========================================================================
 class CDIT(nn.Module):
-    """跨域交互 Transformer：实现判别分支特征与生成分支特征的软共享交互"""
-
     def __init__(self, channels):
         super().__init__()
         self.gate = nn.Sequential(
@@ -329,12 +293,7 @@ class CDIT(nn.Module):
         return dec_enhanced, gen_enhanced
 
 
-# =========================================================================
-# 核心模块 4：焦点/离焦边界 (FDB) 提取器
-# =========================================================================
 class FDBBoundaryExtractor(nn.Module):
-    """焦点/离焦边界 (FDB) 提取器：利用形态学膨胀与腐蚀提取决策图边缘"""
-
     def __init__(self, kernel_size=5):
         super().__init__()
         self.pad = kernel_size // 2
@@ -357,22 +316,15 @@ class FDBBoundaryExtractor(nn.Module):
         return boundary_mask
 
 
-# =========================================================================
-# 主网络：融合三大方案的 PDR-MultiFocusFusionNet Pro (精准优化版)
-# =========================================================================
 class PDRMultiFocusFusionNet(nn.Module):
-    """渐进式决策修复多聚焦图像融合网络 (突破 93% 准确率上限精修版)"""
-
     def __init__(
         self, in_channels=3, out_channels=64, embed_dim=64, reduction_size=32
     ):
         super().__init__()
 
-        # ---------------- 1. 深度残差编码器 (提升高频与梯度表征能力) ----------------
-        self.enc1 = ResBlock(in_channels, embed_dim // 2, stride=2)  # H/2, C/2
-        self.enc2 = ResBlock(embed_dim // 2, embed_dim, stride=2)  # H/4, C
+        self.enc1 = ResBlock(in_channels, embed_dim // 2, stride=2)
+        self.enc2 = ResBlock(embed_dim // 2, embed_dim, stride=2)
 
-        # ---------------- 2. 瓶颈层与 DCP 交互 Transformer ----------------
         self.interactive_A_to_B = InteractiveTransformerBlock(
             embed_dim, num_heads=4, reduction_size=reduction_size
         )
@@ -387,11 +339,8 @@ class PDRMultiFocusFusionNet(nn.Module):
             nn.GELU(),
         )
 
-        # 粗决策预测头 (1/4 分辨率)
         self.coarse_head = nn.Conv2d(embed_dim, 1, kernel_size=3, padding=1)
 
-        # ---------------- 3. 解码 Level 1 (1/2 分辨率) ----------------
-        # [判别分支]
         self.dec_up1 = nn.Sequential(
             nn.Conv2d(embed_dim, embed_dim * 4, kernel_size=3, padding=1),
             nn.PixelShuffle(2),
@@ -408,7 +357,6 @@ class PDRMultiFocusFusionNet(nn.Module):
         )
         self.refine_head1 = nn.Conv2d(embed_dim, 1, kernel_size=3, padding=1)
 
-        # [生成分支 Level 1]
         self.gen_up1 = nn.Sequential(
             nn.Conv2d(embed_dim, embed_dim * 4, kernel_size=3, padding=1),
             nn.PixelShuffle(2),
@@ -416,11 +364,8 @@ class PDRMultiFocusFusionNet(nn.Module):
             nn.GELU(),
         )
 
-        # [跨域交互模块 CDIT 1]
         self.cdit1 = CDIT(embed_dim)
 
-        # ---------------- 4. 解码 Level 2 (全分辨率 1x) ----------------
-        # [判别分支]
         self.dec_up2 = nn.Sequential(
             nn.Conv2d(embed_dim, out_channels * 4, kernel_size=3, padding=1),
             nn.PixelShuffle(2),
@@ -442,7 +387,6 @@ class PDRMultiFocusFusionNet(nn.Module):
             out_channels, 1, kernel_size=3, padding=1
         )
 
-        # [生成分支 Level 2 与预测头]
         self.gen_up2 = nn.Sequential(
             nn.Conv2d(embed_dim, out_channels * 4, kernel_size=3, padding=1),
             nn.PixelShuffle(2),
@@ -456,18 +400,15 @@ class PDRMultiFocusFusionNet(nn.Module):
             nn.Sigmoid(),
         )
 
-        # ---------------- 5. FDB 边界提取器 ----------------
         self.fdb_extractor = FDBBoundaryExtractor(kernel_size=5)
 
     def forward(self, img_A, img_B, return_multi_scale=False):
-        # ---------------- Step 1: 深度残差编码提取 ----------------
         enc1_A = self.enc1(img_A)
         enc1_B = self.enc1(img_B)
 
         feat_A = self.enc2(enc1_A)
         feat_B = self.enc2(enc1_B)
 
-        # ---------------- Step 2: DCP 瓶颈交互 ----------------
         fused_A = self.interactive_A_to_B(feat_A, feat_B)
         fused_B = self.interactive_B_to_A(feat_B, feat_A)
 
@@ -477,7 +418,6 @@ class PDRMultiFocusFusionNet(nn.Module):
         logit_0 = self.coarse_head(bottleneck_feat)
         map_0 = torch.sigmoid(logit_0)
 
-        # ---------------- Step 3: Level 1 渐进细化与 CDIT 交互 ----------------
         dec_up1 = self.dec_up1(bottleneck_feat)
         gen_up1 = self.gen_up1(bottleneck_feat)
 
@@ -513,11 +453,9 @@ class PDRMultiFocusFusionNet(nn.Module):
         logit_1 = logit_0_up + delta_logit_1
         map_1 = torch.sigmoid(logit_1)
 
-        # ---------------- Step 4: Level 2 解码 (双分支输出) ----------------
         dec_up2 = self.dec_up2(fused_up1)
         gen_up2 = self.gen_up2(gen_up1)
 
-        # [判别分支]
         raw_concat = torch.cat([img_A, img_B], dim=1)
         raw_feat = self.raw_feat_conv(raw_concat)
         raw_gla = self.gla_level2(raw_feat)
@@ -538,7 +476,6 @@ class PDRMultiFocusFusionNet(nn.Module):
                 align_corners=False,
             )
 
-        # [生成分支：生成全彩融合图像]
         img_gen = self.gen_head(gen_up2 + raw_gla)
         if img_gen.shape[2:] != img_A.shape[2:]:
             img_gen = F.interpolate(
@@ -548,61 +485,43 @@ class PDRMultiFocusFusionNet(nn.Module):
                 align_corners=False,
             )
 
-        # ---------------- Step 5: FDB 复合融合策略 ----------------
         map_detached = map_final.detach()
 
         img_hard = img_A * map_detached + img_B * (1.0 - map_detached)
+
         m_edge = self.fdb_extractor(map_detached)
         img_fused = (1.0 - m_edge) * img_hard + m_edge * img_gen
 
-        # ---------------- Step 6: 模式输出 ----------------
         if self.training or return_multi_scale:
             return img_fused, (map_final, map_1, map_0), img_gen
         else:
             return img_fused, map_final
 
 
-# =========================================================================
-# 测试验证脚本
-# =========================================================================
 if __name__ == "__main__":
-    print(
-        "正在构建精修版 PDR 多聚焦图像融合网络 (突破 93% 准确率上限)... \n"
-    )
     model = PDRMultiFocusFusionNet().to(DEVICE)
     model.eval()
 
-    # ---------------------------------------------------------
-    # 测试 1: 常规分辨率 (计算标准参数量与 FLOPs)
-    # ---------------------------------------------------------
-    print("=== 常规测试 (输入 256x256) ===")
+    print("=== Standard Test (Input: 256x256) ===")
     test_tensor_A = torch.rand((1, 3, 256, 256)).to(DEVICE)
     test_tensor_B = torch.rand((1, 3, 256, 256)).to(DEVICE)
 
     flops, params = profile(
         model, inputs=(test_tensor_A, test_tensor_B), verbose=False
     )
-    print("✅ 计算完成！")
-    print(f"📌 FLOPs (计算量): {flops / 1e9:.3f} G")
-    print(f"📌 Params (参数量): {params / 1e6:.3f} M")
+    print(f"FLOPs: {flops / 1e9:.3f} G")
+    print(f"Params: {params / 1e6:.3f} M")
 
-    # ---------------------------------------------------------
-    # 测试 2: 多任务训练模式输出测试 (深监督 + 生成损失)
-    # ---------------------------------------------------------
-    print("\n=== 多任务训练模式测试 (Training Mode) ===")
+    print("\n=== Multi-Task Training Mode Test ===")
     model.train()
     img_fused, dec_maps, img_gen = model(test_tensor_A, test_tensor_B)
-    print("✅ 成功生成多任务输出：")
-    print(f"   - 最终 FDB 复合融合图形状:   {img_fused.shape}")
-    print(f"   - 1x 判别决策图 M_final 形状:  {dec_maps[0].shape}")
-    print(f"   - 1/2 阶中间决策图 M_1 形状:   {dec_maps[1].shape}")
-    print(f"   - 1/4 阶粗略决策图 M_0 形状:   {dec_maps[2].shape}")
-    print(f"   - 生成分支全彩图像 I_gen 形状: {img_gen.shape}")
+    print(f"Fused Image Shape: {img_fused.shape}")
+    print(f"M_final Shape:     {dec_maps[0].shape}")
+    print(f"M_1 Shape:         {dec_maps[1].shape}")
+    print(f"M_0 Shape:         {dec_maps[2].shape}")
+    print(f"I_gen Shape:       {img_gen.shape}")
 
-    # ---------------------------------------------------------
-    # 测试 3: 高分辨率极限压力测试 (1024x1024)
-    # ---------------------------------------------------------
-    print("\n=== 高分辨率极限压力测试 (输入 1024x1024) ===")
+    print("\n=== High-Resolution Stress Test (Input: 1024x1024) ===")
     model.eval()
     high_res_A = torch.rand((1, 3, 1024, 1024)).to(DEVICE)
     high_res_B = torch.rand((1, 3, 1024, 1024)).to(DEVICE)
@@ -612,7 +531,6 @@ if __name__ == "__main__":
         final_fused, final_map = model(high_res_A, high_res_B)
     end = time.time()
 
-    print("✅ 高分辨率测试成功！(显存安全，无 OOM 卡死)")
-    print(f"📌 单次大图推理耗时: {end - start:.3f} 秒")
-    print(f"📌 输出复合融合图形状: {final_fused.shape}")
-    print(f"📌 输出决策图形状:     {final_map.shape}")
+    print(f"Inference Time:    {end - start:.3f} s")
+    print(f"Fused Image Shape: {final_fused.shape}")
+    print(f"Decision Map Shape: {final_map.shape}")
